@@ -1,151 +1,187 @@
 import streamlit as st
 import pandas as pd
+import requests
+import folium
+from folium.plugins import HeatMap
+from streamlit_folium import folium_static
+import pandas as pd
 import math
 from pathlib import Path
-
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
-)
+from datetime import datetime, timedelta
+import io
+import pydeck as pdk
+import numpy as np
 
 # -----------------------------------------------------------------------------
-# Declare some useful functions.
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
+st.title("USGS Geomagnetic Data - BOU Station")
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
+# Constants
+STATIONS = {
+    "BOU": {"lat": 40.137, "lon": -105.237},
+    "BDT": {"lat": 46.283, "lon": -96.617}
+}
+BOU_COORDINATES = {"lat": 40.137, "lon": -105.237}
+BASE_URL = "https://geomag.usgs.gov/ws/data/"
 
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
+# Time range: last 24 hours
+end_time = datetime.utcnow()
+start_time = end_time - timedelta(hours=24)
 
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
+# Format times
+start_str = start_time.strftime("%Y-%m-%dT%H:%M:%S")
+end_str = end_time.strftime("%Y-%m-%dT%H:%M:%S")
 
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
-    )
+params = {
+    "id": "BOU",
+    "format": "iaga2002",
+    "elements": "X,Y,Z,F",
+    "starttime": start_str,
+    "endtime": end_str
+}
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
+st.markdown(f"### Fetching data from {start_str} to {end_str} UTC")
 
-    return gdp_df
+# Fetch data
+response = requests.get(BASE_URL, params=params)
 
-gdp_df = get_gdp_data()
+if response.status_code == 200:
+    raw_data = response.text
 
+    # Parse IAGA2002 format (skip header, read columns)
+    lines = raw_data.splitlines()
+    data_start = 0
+    for i, line in enumerate(lines):
+        if line.startswith("DATE"):
+            data_start = i
+            break
+
+    # Read data into DataFrame
+    data_io = io.StringIO("\n".join(lines[data_start:]))
+    df = pd.read_csv(data_io, delim_whitespace=True, parse_dates=[[0, 1]], na_values=["99999.00", "99999.000"])
+    df.columns = ['Date','time', 'Y','X', 'Y', 'Z', 'F']
+
+    # Drop missing values
+    df.dropna(inplace=True)
+
+    # Display map
+    st.map(pd.DataFrame([BOU_COORDINATES], columns=["lat", "lon"]))
+
+    # Plot time series
+    st.line_chart(df.set_index("Date")[["time",'Y','X', 'Y', 'Z', 'F']])
+else:
+    st.error(f"Failed to retrieve data. Status code: {response.status_code}")
+
+# ---
+# st.title("USGS Geomagnetic Data - BOU & BDT Stations")
+
+# Station coordinates
+STATIONS = {
+    "BOU": {"lat": 40.137, "lon": -105.237},
+    "BRW": {"lat": 46.283, "lon": -96.617}
+}
+
+BASE_URL = "https://geomag.usgs.gov/ws/data/?id="
+end_time = datetime.utcnow()
+start_time = end_time - timedelta(hours=24)
+start_str = start_time.strftime("%Y-%m-%dT%H:%M:%S")
+end_str = end_time.strftime("%Y-%m-%dT%H:%M:%S")
+
+params_template = {
+    "format": "iaga2002",
+    "elements": "X,Y,Z,F",
+    "starttime": start_str,
+    "endtime": end_str
+}    
+@st.cache_data(ttl=3600)
+def fetch_station_data(station_id):
+    params = params_template.copy()
+    params["id"] = station_id
+    response = requests.get(BASE_URL, params=params)
+    
+    if response.status_code != 200:
+        st.error(f"Failed to retrieve data for {station_id}")
+        return None
+
+    lines = response.text.splitlines()
+    data_start = 0
+    for i, line in enumerate(lines):
+        if line.startswith("DATE"):
+            data_start = i
+            break
+    data_io = io.StringIO("\n".join(lines[data_start:]))
+    df = pd.read_csv(data_io, delim_whitespace=True, parse_dates=[[0, 1]], na_values=["99999.00", "99999.000"])
+    df.columns = ['Date','time','dY', 'X', 'Y', 'Z', 'F']
+    df.dropna(inplace=True)
+    return df
+ # Fetch and display both stations
+dataframes = {}
+for station in STATIONS:
+    df = fetch_station_data(station)
+    if df is not None:
+        st.subheader(f"{station} Magnetic Field Components")
+        st.line_chart(df.set_index("Date")[['time','dY','X', 'Y', 'Z', 'F']])
+        dataframes[station] = df
+
+# Prepare heatmap data from the last reading of each station
+heatmap_data = []
+for station, df in dataframes.items():
+    if not df.empty:
+        latest = df.iloc[-1]
+        heatmap_data.append({
+            "lat": STATIONS[station]["lat"],
+            "lon": STATIONS[station]["lon"],
+            "F": latest["F"]
+        })
+
+# Create DataFrame for heatmap
+heatmap_df = pd.DataFrame(heatmap_data)
+
+if not heatmap_df.empty:
+    st.subheader("Magnetic Field Intensity Heatmap (F)")
+    st.pydeck_chart(pdk.Deck(
+        map_style="mapbox://styles/mapbox/light-v9",
+        initial_view_state=pdk.ViewState(
+            latitude=43,
+            longitude=-101,
+            zoom=4,
+            pitch=40,
+        ),
+        layers=[
+            pdk.Layer(
+                "HeatmapLayer",
+                data=heatmap_df,
+                get_position='[lon, lat]',
+                get_weight="F",
+                radiusPixels=60,
+                aggregation='MEAN'
+            )
+        ]
+    ))
+else:
+    st.warning("No data available to generate heatmap.")   
 # -----------------------------------------------------------------------------
 # Draw the actual page
 
+# Title
+st.title("Open Source Map of America")
+
+# Create a Folium map centered on the geographic center of the USA
+us_center_coords = [39.8283, -98.5795]  # Approximate center of the continental USA
+
+# Create the map
+m = folium.Map(location=us_center_coords, zoom_start=4, tiles='OpenStreetMap')
+
+# Optional: Add marker for Washington D.C.
+folium.Marker(
+    location=[38.9072, -77.0369],
+    popup='Washington, D.C.',
+    icon=folium.Icon(color='blue')
+).add_to(m)
+
+# Display map
+folium_static(m)
+
 # Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
-
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
-
-# Add some spacing
-''
-''
-
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
-
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
-
-countries = gdp_df['Country Code'].unique()
-
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
-
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
-
-''
-''
 
 
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
-
-st.header(f'GDP in {to_year}', divider='gray')
-
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
-
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
